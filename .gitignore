@@ -1,0 +1,27 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/app/build
+/app/release
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# 本地改版前的源码快照（历史备份，目录和单文件都不入库）
+_backup_*
+# 分析用的 ROM 参考包（只有 apk，已被 *.apk 覆盖，目录本身也排除）
+_rom/
+# IDE / 工具缓存
+.workbuddy/
+.kotlin/
+# 厂商 Windows 端工具（可重新下载，非本项目源码）
+AZ100Connect.exe
+AZ100_Connect_win64.zip

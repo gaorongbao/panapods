@@ -1,0 +1,9 @@
+﻿DEX classes.dex (2105660 bytes)
+  [hideDup active] = True
+  [hideDup main] = True
+  [hideDup lc3] = True
+  [hideDup first-wins] = True
+  [lastAllowedPanaAddr] = True
+  [lastAllowedPanaAt] = True
+  [hiddenLeAddresses] = True
+  [prewarm Pana from bridge mac] = True

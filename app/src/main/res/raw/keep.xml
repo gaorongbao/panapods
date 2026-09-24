@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  防止 R8 资源压缩器删除 xposed_scope 数组。
+  LSPosed 在运行时通过 manifest meta-data 读取此资源，
+  但 R8 静态分析看不到引用，会误删。
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@array/xposed_scope" />

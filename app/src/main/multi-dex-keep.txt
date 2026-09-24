@@ -1,0 +1,7 @@
+com/panapods/hook/HookEntry.class
+com/panapods/hook/HyperOSHeadsetHook.class
+com/panapods/hook/SettingsHeadsetHook.class
+com/panapods/hook/MiLinkServiceHook.class
+com/panapods/bridge/PanaBridge.class
+io/github/libxposed/api/XposedModule.class
+io/github/libxposed/api/XposedModuleInterface.class

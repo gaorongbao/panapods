@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PanaPods</string>
+    <string name="xposed_description">HyperOS system-level Panasonic/Technics EAH-AZ series earphone control</string>
+
+    <!-- ANC -->
+    <string name="anc_off">关闭</string>
+    <string name="anc_noise_canceling">降噪</string>
+    <string name="anc_ambient">环境声</string>
+    <string name="anc_transparent">透明模式</string>
+    <string name="anc_attention">注意模式</string>
+    <string name="anc_unknown">未知</string>
+
+    <!-- EQ -->
+    <string name="eq_default">默认</string>
+    <string name="eq_bass_enhancer">低音增强</string>
+    <string name="eq_clear_voice">清晰人声</string>
+    <string name="eq_custom">自定义</string>
+    <string name="eq_super_bass">超级低音</string>
+    <string name="eq_bass_enhancer_2">低音增强 2</string>
+    <string name="eq_clear_voice_2">清晰人声 2</string>
+    <string name="eq_custom_2">自定义 2</string>
+    <string name="eq_custom_3">自定义 3</string>
+    <string name="sound_mode_unknown">未知 (%1$d)</string>
+
+    <!-- UI -->
+    <string name="home">主页</string>
+    <string name="earphones">耳机</string>
+    <string name="settings">设置</string>
+    <string name="battery_left">左耳</string>
+    <string name="battery_right">右耳</string>
+    <string name="battery_case">充电盒</string>
+    <string name="not_connected">未连接</string>
+    <string name="connecting">连接中…</string>
+    <string name="connected">已连接</string>
+
+    <!-- Features -->
+    <string name="noise_canceling_adjust">NC 增益调节</string>
+    <string name="adaptive_anc">自适应降噪</string>
+    <string name="spatial_audio">空间音频</string>
+    <string name="head_tracking">头部追踪</string>
+    <string name="multi_point">多点连接</string>
+    <string name="find_earphone">查找耳机</string>
+    <string name="power_off">关机</string>
+    <string name="protocol_debug">协议调试</string>
+
+    <string name="service_notification_running">PanaPods 运行中</string>
+    <string name="service_connecting">正在连接...</string>
+    <string name="service_connected">已连接</string>
+    <string name="service_disconnected">已断开</string>
+    <string name="service_not_connected">未连接</string>
+    <string name="notification_status_format">L:%1$s R:%2$s C:%3$s | %4$s</string>
+    <string name="battery_status_title">电量状态</string>
+    <string name="anc_mode_title">降噪模式</string>
+    <string name="ambient_mode_title">环境声模式</string>
+    <string name="action_disconnect">断开</string>
+    <string name="action_reconnect">重新连接</string>
+    <string name="tab_control">控制</string>
+    <string name="tab_debug">调试</string>
+</resources>

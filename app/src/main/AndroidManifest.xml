@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 蓝牙权限 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_PRIVILEGED" />
+
+    <!-- 前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 开机启动 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 位置 (BLE 扫描需要，Android 12 以下才请求) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- BLE 功能声明 -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <application
+        android:name=".PanaPodsApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PanaPods">
+
+        <!-- ========== 主界面 ========== -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.PanaPods">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+        </activity>
+
+        <!-- ========== BLE 前台服务 ========== -->
+        <service
+            android:name=".ble.PanaBleService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!-- ========== 开机启动接收器 ========== -->
+        <receiver
+            android:name=".receivers.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ========== Root 保活周期拉起接收器 (显式广播，无需 intent-filter) ========== -->
+        <receiver
+            android:name=".receivers.KeepAliveReceiver"
+            android:exported="false" />
+
+        <!-- ========== Hook 反向控制命令接收器 (exported 供系统进程发送) ========== -->
+        <receiver
+            android:name=".bridge.PanaCommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.panapods.bridge.COMMAND" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ========== App 状态广播显式接收器 (exported 供本应用发送给各系统进程) ========== -->
+        <receiver
+            android:name=".bridge.PanaStateReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.panapods.bridge.STATE_UPDATED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ========== 跨进程状态共享 ContentProvider ========== -->
+        <provider
+            android:name=".bridge.PanaPodsProvider"
+            android:authorities="com.panapods.provider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- ========== 蓝牙事件接收器 (静态声明，进程被杀后仍能被系统拉起) ========== -->
+        <!-- ACL_CONNECTED / ACL_DISCONNECTED / STATE_CHANGED 均在隐式广播例外名单中，
+             Manifest 声明可在 app 未运行时接收，从而在耳机连上后重新拉起 BLE 服务。
+             exported="true"：这些广播由系统发出。 -->
+        <receiver
+            android:name=".receivers.BluetoothEventReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                <action android:name="android.bluetooth.device.action.ACL_DISCONNECTED" />
+                <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>
