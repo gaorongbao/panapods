@@ -1,4 +1,4 @@
-package com.panapods.bridge
+﻿package com.panapods.bridge
 
 import com.panapods.headphones.AncMode
 
@@ -10,13 +10,13 @@ import android.os.Bundle
 import com.panapods.utils.PanaLog
 
 /**
-  * App → Hook 状态桥接器
+ * App ↔ Hook 状态桥接器
  *
-  * 通过 Broadcast 在 App 进程 (BLE Service) 和 Xposed Hook 进程
-  * (com.android.bluetooth / com.android.settings) 之间同步耳机状态。
+ * 通过 Broadcast 在 App 进程 (BLE Service) 和 Xposed Hook 进程
+ * (com.android.bluetooth / com.android.settings) 之间同步耳机状态。
  *
-  * App 侧: publishState() 广播状态；
-  * Hook 侧: registerStateReceiver() 接收广播并缓存 → 供 Hook 读取
+ * App 侧: publishState() 广播状态；
+ * Hook 侧: registerStateReceiver() 接收广播并缓存 → 供 Hook 读取
  */
 object PanaBridge {
 
@@ -89,30 +89,33 @@ object PanaBridge {
     @Volatile private var panaOuiPrefix: String? = null  // v127b：Pana OUI 前 3 字节，由 macAddress 自动推算
     @Volatile private var receiverRegistered: Boolean = false
 
-        // ============ L1 缓存：设备地址识别（避免 device.name Binder IPC）============
-        // 三级缓存结构，提升 Hook 性能：
-        // - panaAddresses: 确认为 Pana 的地址集合（秒级查询）
-        // - nonPanaAddresses: 确认不是 Pana 的地址集合
+    // ============ L1 缓存：设备地址识别（避免 device.name Binder IPC）============
+    // 三级缓存结构，提升 Hook 性能：
+    // - panaAddresses: 确认为 Pana 的地址集合（秒级查询）
+    // - nonPanaAddresses: 确认不是 Pana 的地址集合
     private val panaAddresses = java.util.Collections.newSetFromMap(
         java.util.concurrent.ConcurrentHashMap<String, Boolean>()
     )
     private val nonPanaAddresses = java.util.Collections.newSetFromMap(
         java.util.concurrent.ConcurrentHashMap<String, Boolean>()
     )
-        // ============ L2 缓存：活动设备与 ANC 本地状态 ============
+    // ============ L2 缓存：活动设备与 ANC 本地状态 ============
     @Volatile private var classicPanaDevice: android.bluetooth.BluetoothDevice? = null
     @Volatile private var currentAncMode: Int = -1
     @Volatile private var lastAncClickAt: Long = 0L
 
-        // ============ App 侧: 广播状态 ============
+    // ============ App 侧: 广播状态 ============
 
     /**
-          * 广播最新状态 (BLE Service 侧调用)
+     * 广播最新状态 (BLE Service 侧调用)
      *
-          * 这是隐式广播：Hook 进程（com.android.bluetooth / com.android.settings 等）
-          * 中动态注册的 RECEIVER_EXPORTED 接收器依赖它接收状态。不能用
-          * setPackage/setClassName 改成显式广播，否则 Hook 进程收不到。
-          * Android 14 对跨应用隐式广播的限制由 Provider 轮询兜底。
+     * 这是隐式广播：Hook 进程（com.android.bluetooth / com.android.settings 等）
+     * 中动态注册的 RECEIVER_EXPORTED 接收器依赖它接收状态。不能用
+     * setPackage/setClassName 改成显式广播，否则 Hook 进程收不到。
+     * Android 14 对跨应用隐式广播的限制由 Provider 轮询兜底。
+     *
+     * v177：只更新非 -1 的电量字段，避免 300ms 防抖窗口内中间态 -1(显示为 255) 覆盖
+     * 旧有效值。anc/name/addr/connected 全量更新。
      */
     fun publishState(
         context: Context,
@@ -133,12 +136,27 @@ object PanaBridge {
             if (lc3Addr != null) putExtra(EXTRA_LC3_MAC_ADDRESS, lc3Addr)
         }
         runCatching {
-                        // 发送普通广播，使所有进程都能接收到（包括 Hook 进程）
+            // 发送普通广播，使所有进程都能接收到（包括 Hook 进程）
             context.sendBroadcast(intent)
             PanaLog.d(TAG, "publishState broadcast sent from ${context.packageName}")
         }.onFailure { e ->
             PanaLog.e(TAG, "publishState broadcast failed", e)
         }
+        // 同步更新本进程缓存：只覆盖非 -1 的电量，防止防抖窗口内中间态外泄
+        if (left != -1) leftBattery = left
+        if (right != -1) rightBattery = right
+        if (cradle != -1) cradleBattery = cradle
+        ancMode = anc
+        deviceName = name
+        macAddress = addr
+        isConnected = connected
+        if (!lc3Addr.isNullOrBlank() && !lc3Addr.equals(addr, ignoreCase = true)) {
+            lc3MacAddress = lc3Addr
+        }
+        if (!addr.isNullOrBlank() && addr.length >= 8) {
+            panaOuiPrefix = addr.substring(0, 8)
+        }
+        PanaLog.d(TAG, "Bridge cache updated: L=$leftBattery R=$rightBattery C=$cradleBattery anc=$ancMode connected=$isConnected")
     }
 
     /**
@@ -151,7 +169,7 @@ object PanaBridge {
     fun sendAncModeToApp(context: Context?, mode: Int): Boolean {
         if (context == null || !AncMode.isValid(mode)) return false
         // Provider.call 成功时应返回非 null Bundle；权限不足/Provider 不可用时会返回 null，
-        // 此时再走显式广播兜底，避免“命令实际未执行但误以为成功”。
+        // 此时再走显式广播兜底，避免"命令实际未执行但误以为成功"。
         val providerBundle = runCatching {
             val extras = Bundle().apply { putInt(PanaPodsProvider.EXTRA_MODE, mode) }
             context.contentResolver.call(
@@ -180,10 +198,10 @@ object PanaBridge {
         return false
     }
 
-        // ============ Hook 侧: 接收并缓存 ============
+    // ============ Hook 侧: 接收并缓存 ============
 
     /**
-          * 注册状态广播接收器 (供 Hook install 时调用, 每个进程只注册一次)
+     * 注册状态广播接收器 (供 Hook install 时调用, 每个进程只注册一次)
      */
     fun registerStateReceiver(context: Context?) {
         if (receiverRegistered || context == null) return
@@ -203,10 +221,10 @@ object PanaBridge {
     }
 
     /**
-          * 从 Intent 更新本进程缓存（供 PanaStateReceiver 和各 Hook 调用）。
-          *
-          * 返回 true 表示校验通过并已更新；false 表示未携带 state token，拒绝更新。
-          * 防止第三方 App 伪造 STATE_UPDATED 广播污染 Hook 侧缓存。
+     * 从 Intent 更新本进程缓存（供 PanaStateReceiver 和各 Hook 调用）。
+     *
+     * 返回 true 表示校验通过并已更新；false 表示未携带 state token，拒绝更新。
+     * 防止第三方 App 伪造 STATE_UPDATED 广播污染 Hook 侧缓存。
      */
     fun updateCacheFromIntent(intent: Intent?): Boolean {
         if (intent == null) return false
@@ -244,7 +262,7 @@ object PanaBridge {
     }
 
     /**
-          * 直接更新本进程缓存（供 HyperOSHeadsetHook 从 ContentProvider 查询后使用）
+     * 直接更新本进程缓存（供 HyperOSHeadsetHook 从 ContentProvider 查询后使用）
      */
     fun publishStateToCache(
         left: Int, right: Int, cradle: Int,
@@ -280,8 +298,8 @@ object PanaBridge {
     fun isConnected(): Boolean = isConnected
 
     /**
-          * 记录同一副耳机在 LC3/LE-Audio 模式下的地址。
-          * 该地址通常与经典蓝牙地址只有最后一个字节不同。
+     * 记录同一副耳机在 LC3/LE-Audio 模式下的地址。
+     * 该地址通常与经典蓝牙地址只有最后一个字节不同。
      */
     fun setLc3MacAddress(address: String?) {
         if (address.isNullOrBlank()) return
@@ -291,8 +309,8 @@ object PanaBridge {
     }
 
     /**
-          * 取左右耳平均电量 (用于系统 BluetoothDevice.getBatteryLevel())
-          * 系统只能显示一个百分比, 取左右平均值最合理
+     * 取左右耳平均电量 (用于系统 BluetoothDevice.getBatteryLevel())
+     * 系统只能显示一个百分比, 取左右平均值最合理
      */
     fun getAverageBattery(): Int {
         // 只统计 0..100 的有效电量；单耳连接时缺失的那只耳（-1 或 255）
@@ -313,23 +331,23 @@ object PanaBridge {
     /** 统一归一化：只接受 0..100 的有效电量，其余返回 null（供 UI/状态层使用）。 */
     fun normalizeBatteryOrNull(level: Int): Int? = level.takeIf { it in 0..100 }
 
-        // ============ 设备识别 ============
+    // ============ 设备识别 ============
 
     private val PANA_KEYWORDS = listOf("Technics", "EAH-AZ", "AZ100", "Panasonic")
 
     /**
-          * 判断地址是否为 Pana 设备（优先使用 L1 缓存，三次达成一次 Hook 多次调用的优化）
+     * 判断地址是否为 Pana 设备（优先使用 L1 缓存，三次达成一次 Hook 多次调用的优化）
      *
-          * 流程：
-          * 1. 地址 in panaAddresses → true（已检验，秒级响应）
+     * 流程：
+     * 1. 地址 in panaAddresses → true（已检验，秒级响应）
      * 2. 地址 in nonPanaAddresses →false
-          * 3. 设备名称查询 → 不会每次都调 device.name
-          * 4. Bridge 缓存的上一会话名称，此次是同一设备 → true
+     * 3. 设备名称查询 → 不会每次都调 device.name
+     * 4. Bridge 缓存的上一会话名称，此次是同一设备 → true
      * 5. 返回 false 并缓存
      */
-    
+
     /**
-          * 记录 Pana 的经典 DUAL 地址（控制中心主卡片）
+     * 记录 Pana 的经典 DUAL 地址（控制中心主卡片）
      */
     fun setClassicPanaDevice(device: android.bluetooth.BluetoothDevice?) {
         classicPanaDevice = device
@@ -340,7 +358,7 @@ object PanaBridge {
     }
 
     /**
-          * 公开 API: 获取 pana 地址缓存集合
+     * 公开 API: 获取 pana 地址缓存集合
      */
     fun isPanaByAddress(address: String?): Boolean {
         if (address == null) return false
@@ -349,7 +367,7 @@ object PanaBridge {
     }
 
     /**
-          * 公开 API: 检查地址是否在正数据集中
+     * 公开 API: 检查地址是否在正数据集中
      */
     fun isNonPanaByAddress(address: String?): Boolean {
         if (address == null) return false
@@ -358,21 +376,21 @@ object PanaBridge {
     }
 
     /**
-          * 公开 API: 注册 Pana 地址
+     * 公开 API: 注册 Pana 地址
      */
     fun addPanaAddress(address: String) {
         panaAddresses.add(address.uppercase())
     }
 
     /**
-          * 公开 API: 注册非 Pana 地址
+     * 公开 API: 注册非 Pana 地址
      */
     fun addNonPanaAddress(address: String) {
         nonPanaAddresses.add(address.uppercase())
     }
 
     /**
-          * 上报 ANC 本地预判位置（用户点击后立即生效）
+     * 上报 ANC 本地预判位置（用户点击后立即生效）
      */
     fun setCurrentAncMode(mode: Int) {
         currentAncMode = mode
@@ -381,12 +399,12 @@ object PanaBridge {
     }
 
     /**
-          * 获取最近的 ANC 本地状态（经过预判，未待耳机回复）
+     * 获取最近的 ANC 本地状态（经过预判，未待耳机回复）
      */
     fun getCurrentAncMode(): Int = currentAncMode
 
     /**
-          * 获取地址缓存信息（诊断用）
+     * 获取地址缓存信息（诊断用）
      */
     fun getCacheStats(): Map<String, Any> {
         return mapOf(
@@ -398,14 +416,14 @@ object PanaBridge {
     }
 
     /**
-          * 通过 MAC 地址判断是否为当前耳机。
-          * LC3/LE-Audio 模式下系统可能使用不同的地址（通常仅最后一个字节不同），
-          * 因此同时匹配经典地址、LC3 地址以及前 5 段相同的地址变体。
+     * 通过 MAC 地址判断是否为当前耳机。
+     * LC3/LE-Audio 模式下系统可能使用不同的地址（通常仅最后一个字节不同），
+     * 因此同时匹配经典地址、LC3 地址以及前 5 段相同的地址变体。
      */
     fun isCurrentDevice(address: String?): Boolean {
         if (address == null) return false
         return isSameDeviceAddress(address, macAddress) ||
-               isSameDeviceAddress(address, lc3MacAddress)
+                isSameDeviceAddress(address, lc3MacAddress)
     }
 
     /**
@@ -424,8 +442,8 @@ object PanaBridge {
     }
 
     /**
-          * 判断两个 MAC 地址是否为同一设备的地址变体（LE-Audio 常见场景）。
-          * 规则：标准 6 段 MAC，前 5 段完全相同，仅最后一段不同——v176：该规则对本项目失效（坑 #3：实测两地址第 5 段即不同），恒 false 使 pushStatusTo 的兄弟地址兜底永不命中，已改为委托 [isSameDeviceAddress]（前 4 段匹配）。
+     * 判断两个 MAC 地址是否为同一设备的地址变体（LE-Audio 常见场景）。
+     * 规则：标准 6 段 MAC，前 5 段完全相同，仅最后一段不同——v176：该规则对本项目失效（坑 #3：实测两地址第 5 段即不同），恒 false 使 pushStatusTo 的兄弟地址兜底永不命中，已改为委托 [isSameDeviceAddress]（前 4 段匹配）。
      */
     /**
      * Check whether two MAC addresses are siblings of the same device
@@ -436,7 +454,7 @@ object PanaBridge {
         isSameDeviceAddress(base, candidate)
 
     /**
-          * 判断设备名是否为松下/Technics 耳机（原方法保留）
+     * 判断设备名是否为松下/Technics 耳机（原方法保留）
      */
     fun isPana(name: String?): Boolean {
         name ?: return false
@@ -444,7 +462,7 @@ object PanaBridge {
     }
 
     /**
-          * 判断设备名是否为松下/Technics 耳机（别名，兼容性方法）
+     * 判断设备名是否为松下/Technics 耳机（别名，兼容性方法）
      */
     fun isPanaDevice(name: String?): Boolean {
         return isPana(name)

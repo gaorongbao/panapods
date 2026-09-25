@@ -377,19 +377,23 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     // 应答），且看门狗 2s 与刷新周期 2s 相同、每轮又重置 responded 标记，任何一轮 relay
     // 迟到/丢（discovery 返回 ACK、链路抖动）都会把仍在位的副耳电量擦掉，通知与融合中心
     // 表现为“一个耳朵有电量、一个没有”。改为累计连续未应答轮数，慢一轮不再误清。
+    //
+    // v177：修复 partnerBattery == null 时提前 return 导致 streak 永不增、
+    // 重连后补发 relay 永不触发的 bug。现在：只有 partnerBattery != null 且本轮无应答
+    // 才累计 streak；partnerBattery 为 null（新会话/已清空）时不增 streak、也不清空。
     private val partnerBatteryTimeoutRunnable = Runnable {
         if (!isConnected) return@Runnable
         if (batteryTracker.partnerBatteryResponded) {
             batteryTracker.resetPartnerMissStreak()
             return@Runnable
         }
-        if (batteryTracker.partnerBattery == null) return@Runnable
-        val streak = batteryTracker.onPartnerMiss()
+        // 仅当已有缓存电量且本轮无应答时才累计 streak；partnerBattery==null 不计入
+        val streak = batteryTracker.onPartnerMissIfCached()
         if (streak >= PARTNER_BATTERY_MISS_THRESHOLD) {
             PanaLog.d(TAG, "Partner battery unanswered for $streak rounds, clearing")
             batteryTracker.clearPartnerBattery()
             recomputeBatteryState()
-        } else {
+        } else if (streak > 0) {
             PanaLog.d(TAG, "Partner battery unanswered this round (streak=$streak), keeping last value")
         }
     }

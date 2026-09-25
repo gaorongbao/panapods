@@ -75,6 +75,18 @@ class BatteryStateTracker {
         partnerMissStreak = 0
     }
 
+    /**
+     * v177：仅当已有缓存电量（partnerBattery != null）且本轮无应答时累计 streak。
+     * 新会话或已清空时 partnerBattery==null，不增 streak、不清空，避免重连后
+     * 补发 relay 永不触发（refreshBattery 里 partnerMissStreak>0 判定永假）。
+     */
+    fun onPartnerMissIfCached(): Int {
+        if (partnerBattery != null) {
+            partnerMissStreak += 1
+        }
+        return partnerMissStreak
+    }
+
     fun onSideProbeReceived(side: Int, present: Boolean) {
         if (side == PanaProtocolEngine.SIDE_LEFT) {
             leftPresent = present

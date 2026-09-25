@@ -53,7 +53,9 @@ class HookEntry : XposedModule() {
     }
 
     override fun onPackageLoaded(param: PackageLoadedParam) {
-        initLogSwitch()
+        // contentcatcher 进程不在 Provider 白名单中，无法查询日志开关，跳过 initLogSwitch
+        val skipLogInit = param.packageName == "com.miui.contentcatcher" || processName == "com.miui.contentcatcher"
+        if (!skipLogInit) initLogSwitch()
         try {
             val pkg = param.packageName
             val defaultClassLoader = param.defaultClassLoader
