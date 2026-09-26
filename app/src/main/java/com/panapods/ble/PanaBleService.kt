@@ -258,6 +258,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
     }
 
+    // v178：记录上一次 LE Audio 连接状态，用于检测连接建立瞬间并触发 TWS 同步。
+    @Volatile private var lastLeAudioConnected = false
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
     private var protocolEngine: PanaProtocolEngine? = null
@@ -354,6 +356,16 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                     "POLL-TRACE: tick=$pollTraceTick light=true leAudio=${isLeAudioConnected()} connected=$isConnected"
                 )
             }
+            
+            // v178：检测 LE Audio 连接状态变化，若刚建立则立即触发 TWS 同步，
+            // 确保副耳通过 relay 链路能收到音频转发（防止单耳无声）。
+            val leAudioNow = isLeAudioConnected()
+            if (leAudioNow && !lastLeAudioConnected) {
+                PanaLog.i(TAG, "LE Audio connected detected, triggering immediate TWS sync")
+                triggerTwSync()
+            }
+            lastLeAudioConnected = leAudioNow
+            
             refreshBattery(light = musicActive)
             if (isConnected) {
                 // 防重入：避免 handleConnected 与本 runnable 同时调度造成双循环
@@ -1021,6 +1033,21 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         mainHandler.postDelayed(partnerBatteryTimeoutRunnable, PARTNER_BATTERY_TIMEOUT_MS)
     }
 
+    /** v178：触发 TWS 同步 —— 发现副耳并发起 relay 查询，建立音频转发链路。
+     * 在 LE Audio 连接建立时调用，确保副耳能及时接收音频转发，防止单耳无声。 */
+    private fun triggerTwSync() {
+        val engine = protocolEngine ?: return
+        if (!isConnected) return
+        PanaLog.i(TAG, "Triggering TWS sync for audio forwarding")
+        // 发现副耳 dst
+        engine.discoverPartnerDst()
+        // 若已有缓存的 dst，立即补发一次 relay 查询，建立转发路径
+        if (partnerDstType >= 0 && partnerDstId >= 0) {
+            PanaLog.d(TAG, "TWS sync: supplemental relay to type=$partnerDstType id=$partnerDstId")
+            engine.relayGetBattery(partnerDstType, partnerDstId)
+        }
+    }
+
     /** 是否有媒体正在播放（音乐/视频/通话），用于自适应放缓 GATT 轮询。 */
     private fun isMusicActive(): Boolean {
         return try {
@@ -1123,6 +1150,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // v168：副耳 dst 是跨会话无效的（重连后固件可能重新分配）
         partnerDstType = -1
         partnerDstId = -1
+        // v178：重置 LE Audio 连接状态标记，下次连接时重新触发 TWS 同步
+        lastLeAudioConnected = false
     }
 
     /**
