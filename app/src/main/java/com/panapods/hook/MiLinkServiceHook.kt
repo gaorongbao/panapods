@@ -90,6 +90,9 @@ object MiLinkServiceHook {
         // 诊断用：记录已打印 hook 命中日志的 method|addr，避免刷屏
     private val loggedHooks =
         java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        // v177：reapInactivePanaAddress 两轮确认机制的待清理地址缓存。
+    // 防止 profile 代理竞态导致误清：需连续两轮 3s 保活都满足离线条件才真清。
+    @Volatile private var pendingReapAddr: String? = null
         // v99：融合中心当前活动 Pana 地址（ProfileContext.getActiveDevice 观测值）。
         // LC3/LE-Audio 模式下为 LE/LC3 副地址，经典模式下为主地址。卡片应建立在该地址上，
         // 而不是强行重定向回主地址（旧逻辑会让卡片与真实活动设备错位，ANC 控件时有时无）。
@@ -128,6 +131,10 @@ object MiLinkServiceHook {
     // v114：缓存 setHeadsetPropertyChangeListener 注入的 listener 实例。
     // getter 在部分进程/时机返回 null（runtime 懒初始化），缓存后 nudge 不再依赖 getter。
     @Volatile private var cachedHeadsetListener: Any? = null
+    // v177：listener 尚未初始化时的待执行回调队列。setHeadsetPropertyChangeListener 被调用时触发。
+    private val listenerReadyCallbacks = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<Runnable, Boolean>()
+    )
         // v100：事件驱动刷新 —— 收到 app 状态广播（电量/ANC/连接态真正变化）时才补发 nudge，
         // 替代 v99.6 的 10 连发定时 nudge，减少 milink/SystemUI 反复重 assemble 与 app 唤醒。
     @Volatile private var bridgeStateRefreshRegistered = false
@@ -174,11 +181,23 @@ object MiLinkServiceHook {
     }
 
     /** v125：启动卡片活跃密集刷新窗口（幂等 —— 窗口进行中不重置，防止
-     *  "hit→广播→窗口→nudge→重渲染→hit"自我延续的重建风暴循环）。 */
+     *  "hit→广播→窗口→nudge→重渲染→hit"自我延续的重建风暴循环）。
+     *
+     * v177：窗口进行中时改为延长而非拒绝，覆盖"点开→离开→5s 后再点"场景，
+     * 避免二次点开回到冷启动路径（listener 缺失 + 2s 节流 + 3s 保活等待）。
+     */
     fun startCardActiveWindow() {
         val now = System.currentTimeMillis()
-        if (now < cardActiveUntil) return  // 窗口已激活：不重置，让上一轮自然衰减
-        cardActiveUntil = now + CARD_ACTIVE_WINDOW_MS
+        val newUntil = now + CARD_ACTIVE_WINDOW_MS
+        if (now < cardActiveUntil) {
+            // v177：窗口进行中 → 延长而非拒绝
+            if (newUntil > cardActiveUntil) {
+                cardActiveUntil = newUntil
+                PanaLog.d(TAG, "Card active window extended to ${cardActiveUntil}")
+            }
+            return
+        }
+        cardActiveUntil = newUntil
         keepAliveHandler.removeCallbacks(keepAliveRunnable)
         keepAliveHandler.postDelayed(keepAliveRunnable, CARD_ACTIVE_INTERVAL_MS)
         // 窗口开始时立即补一次 nudge，不等下一个 tick。
@@ -371,14 +390,34 @@ object MiLinkServiceHook {
      *
      * 三重确认 Pana 确实不在线才清（Bridge 广播 / LE Audio lead / 系统 profile），
      * 保留"milink 进程错过连接广播"场景下的兜底能力 —— 这正是该字段存在的原因。
+     *
+     * v177：引入两轮确认机制（pendingReapAddr）。需连续两轮 3s 保活都满足离线条件
+     * 才真清，防止 profile 代理竞态/惰性初始化导致误清。同时加入 Bridge 连接态兜底。
      */
     private fun reapInactivePanaAddress() {
         val addr = activePanaAddress ?: return
-        if (PanaBridge.isConnected()) return
-        if (getLeAudioActivePanaAddress() != null) return
-        if (isSystemPanaConnected()) return
-        activePanaAddress = null
-        PanaLog.i(TAG, "active Pana address cleared (device offline): $addr")
+        // Bridge 连接态兜底：App 层仍连着时绝不清
+        if (PanaBridge.isConnected()) {
+            pendingReapAddr = null
+            return
+        }
+        if (getLeAudioActivePanaAddress() != null) {
+            pendingReapAddr = null
+            return
+        }
+        if (isSystemPanaConnected()) {
+            pendingReapAddr = null
+            return
+        }
+        // 两轮确认：首轮标记，次轮真清
+        if (pendingReapAddr == addr) {
+            activePanaAddress = null
+            pendingReapAddr = null
+            PanaLog.i(TAG, "active Pana address cleared after 2 confirmations (device offline): $addr")
+        } else {
+            pendingReapAddr = addr
+            PanaLog.d(TAG, "active Pana address marked for reap (waiting 2nd confirmation): $addr")
+        }
     }
 
     /** 获取 LE Audio 代理（异步）。就绪后补发一次卡片刷新，使卡片跟随真实 lead 地址。 */
@@ -845,6 +884,7 @@ object MiLinkServiceHook {
         // （getter 大部分时间为 null，nudge 静默死亡）。
         // listener 被 set 的那一刻 = 数据链路就绪的时刻，缓存它并立即 nudge，
         // 让降噪控件在数据链路就绪的第一时间渲染，不再等 3s 广播周期。
+        // v177：同时触发所有等待 listener 初始化的回调（首开/重连场景）。
         try {
             val pcClass = findClass(PROFILE_CONTEXT, classLoader)
             if (pcClass != null) {
@@ -857,6 +897,9 @@ object MiLinkServiceHook {
                                 PanaLog.i(TAG, "headset listener SET (${listener.javaClass.name}), nudging now")
                                 nudgeAncCardRefresh(force = true)
                                 MiLinkCardArtHook.onPanaCardMaybeActive()
+                                // v177：触发所有等待 listener 的回调
+                                listenerReadyCallbacks.forEach { it.run() }
+                                listenerReadyCallbacks.clear()
                             } else {
                                 PanaLog.i(TAG, "headset listener CLEARED")
                             }
@@ -1679,7 +1722,13 @@ object MiLinkServiceHook {
             // getter 依赖 runtime 懒初始化，各进程大部分时间为 null（nudge 静默死亡的主因）。
             val listener = cachedHeadsetListener
                 ?: XposedHelpers.callMethod(XposedHelpers.getStaticObjectField(pcClass, "INSTANCE"), "getHeadsetPropertyChangeListener")
-                ?: run { PanaLog.d(TAG, "nudge: listener null (cached+getter), waiting for set hook"); return }
+            if (listener == null) {
+                // v177：listener 尚未初始化，注册一次性回调，初始化后立即补发（force=true 绕过节流）。
+                val callback = Runnable { nudgeAncCardRefresh(force = true) }
+                listenerReadyCallbacks.add(callback)
+                PanaLog.d(TAG, "nudge: listener null, registered callback (queue=${listenerReadyCallbacks.size})")
+                return
+            }
             val addr = activePanaAddress
                 ?: getLeAudioActivePanaAddress()
                 ?: PanaBridge.getMacAddress()
