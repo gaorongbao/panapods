@@ -33,6 +33,10 @@ object PanaBridge {
     // ============ 通用 Extra ============
     const val EXTRA_LEFT_BATTERY = "left_battery"
     const val EXTRA_RIGHT_BATTERY = "right_battery"
+    // v181：在位探测（-1 未知 / 0 不在位 / 1 在位），配合 -1 电量区分
+    // 「确认不在位（应清缓存）」与「防抖中间态（应保旧值）」。
+    const val EXTRA_LEFT_PRESENT = "left_present"
+    const val EXTRA_RIGHT_PRESENT = "right_present"
     const val EXTRA_CRADLE_BATTERY = "cradle_battery"
     const val EXTRA_ANC_MODE = "anc_mode"
     const val EXTRA_DEVICE_NAME = "device_name"
@@ -116,18 +120,26 @@ object PanaBridge {
      *
      * v177：只更新非 -1 的电量字段，避免 300ms 防抖窗口内中间态 -1(显示为 255) 覆盖
      * 旧有效值。anc/name/addr/connected 全量更新。
+     *
+     * v181：-1 并非全是中间态——「探测确认不在位」的 -1 是合法终态，v177 一律拦截
+     * 会让缓存残留旧电量且永不消失（实测 8 分钟）。现在仅当该侧 [leftPresent]/[rightPresent]
+     * == false（明确不在位）时才允许 -1 清空缓存，其余 -1 仍保旧值。
      */
     fun publishState(
         context: Context,
         left: Int, right: Int, cradle: Int,
         anc: Int, name: String?, addr: String?, connected: Boolean,
-        lc3Addr: String? = null  // v127：副地址，可选（只有 LC3/LE-Audio 才有意义）
+        lc3Addr: String? = null,  // v127：副地址，可选（只有 LC3/LE-Audio 才有意义）
+        leftPresent: Boolean? = null,   // v181：在位探测（null=未知）
+        rightPresent: Boolean? = null
     ) {
-        PanaLog.d(TAG, "publishState: L=$left R=$right C=$cradle anc=$anc addr=$addr lc3=$lc3Addr connected=$connected")
+        PanaLog.d(TAG, "publishState: L=$left R=$right C=$cradle anc=$anc addr=$addr lc3=$lc3Addr connected=$connected present=($leftPresent,$rightPresent)")
         val intent = Intent(ACTION_STATE_UPDATED).apply {
             putExtra(EXTRA_LEFT_BATTERY, normalizeBattery(left))
             putExtra(EXTRA_RIGHT_BATTERY, normalizeBattery(right))
             putExtra(EXTRA_CRADLE_BATTERY, normalizeBattery(cradle))
+            putExtra(EXTRA_LEFT_PRESENT, presenceInt(leftPresent))
+            putExtra(EXTRA_RIGHT_PRESENT, presenceInt(rightPresent))
             putExtra(EXTRA_ANC_MODE, anc)
             putExtra(EXTRA_DEVICE_NAME, name)
             putExtra(EXTRA_MAC_ADDRESS, addr)
@@ -142,9 +154,11 @@ object PanaBridge {
         }.onFailure { e ->
             PanaLog.e(TAG, "publishState broadcast failed", e)
         }
-        // 同步更新本进程缓存：只覆盖非 -1 的电量，防止防抖窗口内中间态外泄
-        if (left != -1) leftBattery = left
-        if (right != -1) rightBattery = right
+        // 同步更新本进程缓存。v177 只放行非 -1（防防抖中间态覆盖）——但「确认不在位」
+        // 的 -1 也被拦住，缓存旧值永不消失（v181 修）。非 -1 照旧覆盖；
+        // -1 仅当该侧探测确认不在位时清空，中间态仍保旧值。
+        if (left != -1) leftBattery = left else if (leftPresent == false) leftBattery = -1
+        if (right != -1) rightBattery = right else if (rightPresent == false) rightBattery = -1
         if (cradle != -1) cradleBattery = cradle
         ancMode = anc
         deviceName = name
@@ -232,8 +246,15 @@ object PanaBridge {
             PanaLog.w(TAG, "Rejected state broadcast without valid token")
             return false
         }
-        leftBattery = normalizeBattery(intent.getIntExtra(EXTRA_LEFT_BATTERY, -1))
-        rightBattery = normalizeBattery(intent.getIntExtra(EXTRA_RIGHT_BATTERY, -1))
+        // v181：与 publishState 同一套清缓存判定——非 -1 照旧覆盖；-1 仅当广播携带
+        // 「确认不在位」(presence==0) 时清空，防抖中间态保持旧值。初值本来就是 -1，
+        // 新旧广播（无 presence extra）行为兼容。
+        val l = normalizeBattery(intent.getIntExtra(EXTRA_LEFT_BATTERY, -1))
+        val r = normalizeBattery(intent.getIntExtra(EXTRA_RIGHT_BATTERY, -1))
+        if (l != -1) leftBattery = l
+        else if (intent.getIntExtra(EXTRA_LEFT_PRESENT, -1) == 0) leftBattery = -1
+        if (r != -1) rightBattery = r
+        else if (intent.getIntExtra(EXTRA_RIGHT_PRESENT, -1) == 0) rightBattery = -1
         cradleBattery = normalizeBattery(intent.getIntExtra(EXTRA_CRADLE_BATTERY, -1))
         ancMode = intent.getIntExtra(EXTRA_ANC_MODE, -1)
         deviceName = intent.getStringExtra(EXTRA_DEVICE_NAME)
@@ -327,6 +348,13 @@ object PanaBridge {
 
     /** 统一归一化：只接受 0..100 的有效电量，其余（含 255=断开、-1=未知）一律 -1 */
     fun normalizeBattery(level: Int): Int = if (level in 0..100) level else -1
+
+    /** v181：在位三态 → 广播 extra（1=在位，0=不在位，-1=未知）。 */
+    private fun presenceInt(present: Boolean?): Int = when (present) {
+        true -> 1
+        false -> 0
+        null -> -1
+    }
 
     /** 统一归一化：只接受 0..100 的有效电量，其余返回 null（供 UI/状态层使用）。 */
     fun normalizeBatteryOrNull(level: Int): Int? = level.takeIf { it in 0..100 }

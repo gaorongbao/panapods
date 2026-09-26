@@ -118,8 +118,8 @@ fun SettingsPage(
             ) {
                 PreferenceRow(
                     icon = "🔄",
-                    title = "左右耳电量对调",
-                    summary = "若电量显示左右相反（左槽显示右耳、右槽显示左耳），请开启此项",
+                    title = "主耳在左（左右对调）",
+                    summary = "主耳=手机直连的那只。若某侧电量落错槽位（左槽显示右耳、入仓耳反而显示电量）请切换；AZ100 此副主耳为左耳，需开启",
                     trailing = {
                         Switch(
                             checked = swapEarSides.value,

@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.view.KeyEvent
 import com.panapods.utils.PanaLog
 import com.panapods.utils.RootKeepAlive
 import com.panapods.R
@@ -262,6 +263,12 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     @Volatile private var lastLeAudioConnected = false
     // v179：记录上一次音乐播放状态，用于检测音频开始流动瞬间。
     @Volatile private var lastMusicActive = false
+    // v181：ACTION_AUDIO_BECOMING_NOISY 收到时刻（0=无）。入仓引发 LE 活动设备
+    // 置 null 时系统广播 NOISY 强制各播放器暂停（≈「入仓 10s 后没音乐」的直接原因）；
+    // 记录时刻，待音频路由恢复后按条件自动续播一次。
+    @Volatile private var noisyPauseAt = 0L
+    // 续播窗口：NOISY 后路由恢复超过该时长即认为与本次停播无关，不再干预。
+    private val noisyResumeWindowMs = 60_000L
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
     private var protocolEngine: PanaProtocolEngine? = null
@@ -372,6 +379,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             if (musicActive && !lastMusicActive) {
                 PanaLog.i(TAG, "Music playback started, triggering TWS sync for audio forwarding")
                 triggerTwSync()
+            } else if (!musicActive && lastMusicActive) {
+                // v181：补记停止时刻（旧版只记开始）。与 NOISY/活动设备日志对齐
+                // 即可直接读出「入仓 → 停播」的间隔。
+                PanaLog.i(
+                    TAG,
+                    "Music playback stopped: Lpresent=${batteryTracker.leftPresent} " +
+                        "Rpresent=${batteryTracker.rightPresent} leAudio=$leAudioNow connected=$isConnected"
+                )
             }
             lastMusicActive = musicActive
             
@@ -976,6 +991,9 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
         PanaLog.d(TAG, "Side probe: side=$side present=$present")
         batteryTracker.onSideProbeReceived(side, present)
+        // v181：clearBatteryForSide 依赖静态主耳侧，先同步设置再清
+        // （recomputeBatteryState 里的同步发生在其后，否则首个回调会按默认值错清一次）
+        batteryTracker.agentIsLeft = config.swapEarSides
         // v179：侧边探测明确不在位时，立即清除该侧电量，避免单耳场景下另一只显示残留电量
         if (!present) {
             clearBatteryForSide(side)
@@ -983,41 +1001,27 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         recomputeBatteryState()
     }
 
-    /** 根据物理侧清除对应的电量缓存（agent/partner 角色不固定，需按当前映射清除）。 */
+    /**
+     * 根据物理侧清除对应的电量缓存（角色→物理侧由静态 [BatteryStateTracker.agentIsLeft] 决定）。
+     *
+     * v181 修两处：
+     * 1. 旧版先取 computeDisplayBatteries 再判 slot!=null——但该侧已不在位、
+     *    显示闸门本就把该槽置 null，守恒假，清除从未真正执行（死代码）；
+     * 2. 删除「在位探测反推 agent 侧」的排除法（主耳入仓仍直连时反推颠倒）。
+     */
     private fun clearBatteryForSide(side: Int) {
-        // 先按当前映射判断哪个角色对应该物理侧，再清除
-        val (leftBat, rightBat) = batteryTracker.computeDisplayBatteries()
-        when (side) {
-            PanaProtocolEngine.SIDE_LEFT -> {
-                if (leftBat != null) {
-                    // 反推：当前左耳对应 agent 还是 partner？
-                    val agentSideIsLeft = when {
-                        batteryTracker.leftPresent == true && batteryTracker.rightPresent == true -> batteryTracker.agentIsLeft
-                        batteryTracker.leftPresent == false -> false
-                        batteryTracker.rightPresent == false -> true
-                        batteryTracker.leftPresent == true -> true
-                        batteryTracker.rightPresent == true -> false
-                        else -> batteryTracker.agentIsLeft
-                    }
-                    if (agentSideIsLeft) batteryTracker.clearAgentBattery() else batteryTracker.clearPartnerBattery()
-                    PanaLog.d(TAG, "Side probe: LEFT not present, cleared ${if (agentSideIsLeft) "agent" else "partner"} battery")
-                }
-            }
-            PanaProtocolEngine.SIDE_RIGHT -> {
-                if (rightBat != null) {
-                    val agentSideIsLeft = when {
-                        batteryTracker.leftPresent == true && batteryTracker.rightPresent == true -> batteryTracker.agentIsLeft
-                        batteryTracker.leftPresent == false -> false
-                        batteryTracker.rightPresent == false -> true
-                        batteryTracker.leftPresent == true -> true
-                        batteryTracker.rightPresent == true -> false
-                        else -> batteryTracker.agentIsLeft
-                    }
-                    if (agentSideIsLeft) batteryTracker.clearPartnerBattery() else batteryTracker.clearAgentBattery()
-                    PanaLog.d(TAG, "Side probe: RIGHT not present, cleared ${if (agentSideIsLeft) "partner" else "agent"} battery")
-                }
-            }
+        val agentOnThisSide =
+            if (side == PanaProtocolEngine.SIDE_LEFT) batteryTracker.agentIsLeft
+            else !batteryTracker.agentIsLeft
+        if (agentOnThisSide) {
+            batteryTracker.clearAgentBattery()
+        } else {
+            batteryTracker.clearPartnerBattery()
         }
+        PanaLog.d(
+            TAG,
+            "Side probe: side=$side not present, cleared ${if (agentOnThisSide) "agent" else "partner"} battery"
+        )
     }
 
     /**
@@ -1025,8 +1029,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
      * 有变化时更新 currentState 并通知 UI。
      */
     private fun recomputeBatteryState() {
-        // v169：左右耳对调开关（用户可选兜底）每次重算前同步，改设置立即生效
-        batteryTracker.swapEarSides = config.swapEarSides
+        // v181：设置项「左右耳电量对调」(swap_ear_sides) 语义重释义为「主耳在左」，
+        // 直接驱动 agent→物理侧映射（旧版是显示末端对调 + 在位探测反推，单耳入仓场景互斥出错）。
+        // 每次重算前同步，改设置立即生效。
+        batteryTracker.agentIsLeft = config.swapEarSides
         val (newLeft, newRight) = batteryTracker.computeDisplayBatteries()
         if (newLeft != currentState.leftBattery || newRight != currentState.rightBattery) {
             currentState = currentState.copy(leftBattery = newLeft, rightBattery = newRight)
@@ -1038,7 +1044,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 TAG,
                 "battery map: agent=${batteryTracker.agentBattery} partner=${batteryTracker.partnerBattery} " +
                     "Lpresent=${batteryTracker.leftPresent} Rpresent=${batteryTracker.rightPresent} " +
-                    "agentIsLeft=${batteryTracker.agentIsLeft} swap=${batteryTracker.swapEarSides} " +
+                    "agentIsLeft=${batteryTracker.agentIsLeft} " +
                     "-> left=${newLeft} right=${newRight}"
             )
         }
@@ -1213,6 +1219,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         lastLeAudioConnected = false
         // v179：重置音乐播放状态标记
         lastMusicActive = false
+        // v181：清除 NOISY 续播标记，防止跨会话误续播
+        noisyPauseAt = 0L
     }
 
     /**
@@ -1366,6 +1374,23 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         try {
             val receiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
+                    val action = intent?.action
+                    // v181：音频路由事件。NOISY 广播不带 EXTRA_DEVICE，必须在
+                    // 下面的设备提取之前分支，否则会被 ?: return 吞掉。
+                    if (action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                        // lastMusicActive 兜底：播放器与本接收器的调度顺序不定，
+                        // 若暂停先落地，isMusicActive() 可能已翻 false。
+                        val playing = lastMusicActive || isMusicActive()
+                        PanaLog.i(TAG, "AUDIO-EVT: ACTION_AUDIO_BECOMING_NOISY playing=$playing")
+                        if (playing) noisyPauseAt = SystemClock.elapsedRealtime()
+                        return
+                    }
+                    if (action != null && action.endsWith("ACTIVE_DEVICE_CHANGED")) {
+                        val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                        PanaLog.i(TAG, "AUDIO-EVT: profile active device -> ${dev?.address ?: "null"} ($action)")
+                        if (dev != null) tryResumeAfterNoisyPause()
+                        return
+                    }
                     val dev = intent?.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
                     val addr = try { dev.address } catch (_: Throwable) { null } ?: return
                     val refs = liveRefsSnapshotForObserver()
@@ -1391,12 +1416,69 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             val filter = IntentFilter().apply {
                 addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
                 addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+                // v181：路由丢失 + 各 profile 活动设备变化（入仓 → LE 活动设备置 null →
+                // NOISY 强制停播的取证与自动续播触发器）
+                addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+                // BluetoothA2dp.ACTION_ACTIVE_DEVICE_CHANGED（该常量在本编译 SDK 不可见，用字面量）
+                addAction("android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED")
+                // LE Audio 活动设备广播（BluetoothLeAudio.ACTION_LE_AUDIO_ACTIVE_DEVICE_CHANGED
+                // 是 @hide 常量，值为 "android.bluetooth.action.LE_AUDIO_ACTIVE_DEVICE_CHANGED"）
+                addAction("android.bluetooth.action.LE_AUDIO_ACTIVE_DEVICE_CHANGED")
             }
             connectionObserverReceiver = receiver.also {
                 registerReceiver(it, filter, Context.RECEIVER_EXPORTED)
             }
         } catch (t: Throwable) {
             PanaLog.w(TAG, "registerSystemConnectionObservers failed: ${t.message}")
+        }
+    }
+
+    /**
+     * v181：NOISY（音频路由丢失）导致的停播，在路由恢复且条件安全时自动续播一次。
+     *
+     * 触发场景（v181 实测取证）：右耳入仓 → 耳机固件重组 LE 链路 → 活动设备被置
+     * null → 系统广播 ACTION_AUDIO_BECOMING_NOISY → 各音乐 App 按规范强制暂停 →
+     * 左耳无声。路由（LE/A2DP 活动设备）恢复后系统不会帮用户续播，这里补上。
+     *
+     * 安全边界（全部满足才发一次 MEDIA_PLAY，否则只清标记）：
+     * 1. NOISY 发生在 60s 内（与本次路由变化相关）；
+     * 2. 当前确实没在播（已暂停）；
+     * 3. 非通话状态（MODE_NORMAL，不干扰微信通话等）；
+     * 4. 至少一侧耳机在位（否则没有去处）。
+     * 用户在窗口内手动暂停的场景因「已暂停 + 60s 窗口」仍有小概率被覆盖，
+     * 但仅限 NOISY 后一分钟内的路由恢复，可接受。
+     */
+    private fun tryResumeAfterNoisyPause() {
+        val since = noisyPauseAt
+        if (since == 0L) return
+        noisyPauseAt = 0L
+        if (!isConnected) return
+        val waited = SystemClock.elapsedRealtime() - since
+        if (waited > noisyResumeWindowMs) {
+            PanaLog.i(TAG, "AUDIO-EVT: route restored, noisy pause stale (${waited / 1000}s) -> no auto play")
+            return
+        }
+        if (isMusicActive()) {
+            PanaLog.i(TAG, "AUDIO-EVT: route restored, already playing -> no auto play")
+            return
+        }
+        val am = audioManager
+        if (am == null || am.mode != AudioManager.MODE_NORMAL) {
+            PanaLog.i(TAG, "AUDIO-EVT: route restored but audio mode=${am?.mode} -> no auto play")
+            return
+        }
+        if (batteryTracker.leftPresent == false && batteryTracker.rightPresent == false) {
+            PanaLog.i(TAG, "AUDIO-EVT: route restored but no ear present -> no auto play")
+            return
+        }
+        PanaLog.i(TAG, "AUDIO-EVT: route restored after noisy pause -> dispatch MEDIA_PLAY")
+        runCatching {
+            val now = SystemClock.uptimeMillis()
+            // API35 编译桩剥离了静态 obtain()，用公开构造器创建
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+        }.onFailure { e ->
+            PanaLog.w(TAG, "AUDIO-EVT: media play dispatch failed: ${e.message}")
         }
     }
 
@@ -1462,7 +1544,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             name = currentState.deviceName,
             addr = currentState.macAddress,
             connected = isConnected,
-            lc3Addr = PanaBridge.getLc3MacAddress()  // v127：通知 Hook 进程 LC3 副地址
+            lc3Addr = PanaBridge.getLc3MacAddress(),  // v127：通知 Hook 进程 LC3 副地址
+            // v181：携带在位探测结果，-1 才能区分「确认不在位(清缓存)」与「防抖中间态(保旧值)」
+            leftPresent = batteryTracker.leftPresent,
+            rightPresent = batteryTracker.rightPresent
         )
     }
 
