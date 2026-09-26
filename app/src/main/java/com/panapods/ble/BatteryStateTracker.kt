@@ -142,6 +142,35 @@ class BatteryStateTracker {
     var agentIsLeft: Boolean = false
 
     /**
+     * v183：动态同步 [agentIsLeft] —— GATT 直连耳（agent）到底是哪一侧。
+     *
+     * v181 的静态映射假设 GATT 永远连在主耳上，但 connect() 在主耳不在线时会
+     * 跟随在线的兄弟地址（单耳使用/主耳回盒，v167 sibling-follow）。此时
+     * agent=副耳，静态映射整体反向：副耳直查电量落进主耳槽位被在位闸门拦掉、
+     * 主耳侧的在位探测反而清掉副耳缓存 → 两只耳都不显示、只剩充电盒电量
+     * （09-26 18:16 实测：retarget 到 …1C:2F 后 L=null R=null C=60）。
+     *
+     * 判定规则（无需知道两耳 MAC 各属哪侧）——只看「恰好一侧在位」时：
+     * - 副耳 relay 电量死亡（partnerBattery==null）：relay 只能经 agent 转发，
+     *   不在位那侧的射频已关，若 agent 在它身上 relay 应可达在位侧；
+     *   relay 死 ⇒ agent 只可能在**在位**那只上（sibling-follow 现场）；
+     * - relay 存活：走静态 swap —— 链路通 ⇒ agent 是主耳
+     *   （v181 的「主耳入仓仍直连、副耳 relay 可达」现场保持原修复）。
+     * 双侧在位 / 状态未知 → 静态 swap。
+     * 已知豁口：主耳入仓但 relay 恰好也死（短暂过渡态）会判成在位侧，
+     * 随 GATT 跟随兄弟后自愈，不值得为此引入不可论证的推断。
+     */
+    fun refreshAgentSide(staticIsLeft: Boolean) {
+        agentIsLeft = when {
+            leftPresent == true && rightPresent != true ->
+                if (partnerBattery == null) true else staticIsLeft
+            rightPresent == true && leftPresent != true ->
+                if (partnerBattery == null) false else staticIsLeft
+            else -> staticIsLeft
+        }
+    }
+
+    /**
      * 把 agent/partner 电量映射到物理左右耳。
      *
      * v181：角色→物理侧只由静态 [agentIsLeft] 决定（见其文档：在位探测反推在

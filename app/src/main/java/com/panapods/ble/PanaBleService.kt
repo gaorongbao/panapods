@@ -385,7 +385,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             }
             lastLeAudioConnected = leAudioNow
             // v182：agent侧 LE Audio 断连检测 + 主动恢复（崩溃重启后系统不重试的场景）
-            maybeRecoverLeAudio(leAudioNow)
+            maybeRecoverLeAudio()
             
             // v179：检测音频开始播放，此时必须确保 TWS 转发链路已建立
             if (musicActive && !lastMusicActive) {
@@ -1003,9 +1003,9 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
         PanaLog.d(TAG, "Side probe: side=$side present=$present")
         batteryTracker.onSideProbeReceived(side, present)
-        // v181：clearBatteryForSide 依赖静态主耳侧，先同步设置再清
+        // v183：先按「单耳在位 + relay 存活」动态定 agent 侧再清
         // （recomputeBatteryState 里的同步发生在其后，否则首个回调会按默认值错清一次）
-        batteryTracker.agentIsLeft = config.swapEarSides
+        batteryTracker.refreshAgentSide(config.swapEarSides)
         // v179：侧边探测明确不在位时，立即清除该侧电量，避免单耳场景下另一只显示残留电量
         if (!present) {
             clearBatteryForSide(side)
@@ -1041,10 +1041,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
      * 有变化时更新 currentState 并通知 UI。
      */
     private fun recomputeBatteryState() {
-        // v181：设置项「左右耳电量对调」(swap_ear_sides) 语义重释义为「主耳在左」，
-        // 直接驱动 agent→物理侧映射（旧版是显示末端对调 + 在位探测反推，单耳入仓场景互斥出错）。
-        // 每次重算前同步，改设置立即生效。
-        batteryTracker.agentIsLeft = config.swapEarSides
+        // v183：主耳侧同步改为动态 refreshAgentSide —— v181 纯静态映射在
+        // GATT 跟随到兄弟地址（主耳回盒）后整体反向（09-26 18:16 实测
+        // L=null R=null C=60），改设置也仍立即生效。
+        batteryTracker.refreshAgentSide(config.swapEarSides)
         val (newLeft, newRight) = batteryTracker.computeDisplayBatteries()
         if (newLeft != currentState.leftBattery || newRight != currentState.rightBattery) {
             currentState = currentState.copy(leftBattery = newLeft, rightBattery = newRight)
@@ -1500,6 +1500,24 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     }
 
     /**
+     * v183：agent 的 LE Audio 是否真的缺失 —— 只认 LE_AUDIO 服务代理的
+     * connectedDevices 是否包含当前 GATT 目标。
+     *
+     * 替代 v182 的四源 isLeAudioConnected() 判定：那套判定依赖 bridge 缓存与
+     * currentState 的精确地址比对，代理绑定竞态期间会把「右耳 LE Audio 其实
+     * 已连」误判成 missing（09-26 18:16 实测连续误报）。代理未绑定（null）或
+     * GATT 目标未知时一律不判定（视作不缺失），宁可漏报也不烧尝试预算。
+     */
+    private fun agentLeAudioMissing(): Boolean {
+        val list = profileProxyDevices(BluetoothProfile.LE_AUDIO) ?: return false
+        val cur = currentState.macAddress ?: return false
+        return list.none { d ->
+            val a = try { d.address } catch (_: Throwable) { null }
+            a != null && a.equals(cur, ignoreCase = true)
+        }
+    }
+
+    /**
      * v182：agent 侧 LE Audio 断连自愈。
      *
      * 实测现场（09-26 17:16:33 蓝牙系统进程崩溃重启）：双耳 LE Audio 直连均超时失败，
@@ -1511,12 +1529,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
      * 触发条件（电量轮询每 2s 一查，全部满足才推进）：
      * 1. GATT 已连接（本轮询本身只在连接态运行）；
      * 2. 至少一侧耳机在位（否则无需音频通道）；
-     * 3. LE Audio 视角确实没有本机（isLeAudioConnected()==false，四个来源全空）；
+     * 3. LE Audio 代理 connectedDevices 不含当前 GATT 目标（agentLeAudioMissing()，
+     *    proxy 未绑定时不判定——v182 实测绑定竞态期间四源判定会误报 missing，
+     *    而 30s 后代理里其实已有右耳，白烧 3 次尝试还误发通知）；
      * 4. A2DP 没有兜底（经典通路已连本耳机时不动）。
      * 检测持续 15s 后开始首次尝试，之后每 30s 一次，单轮最多 3 次；
      * 3 次失败发一条通知提示用户开关蓝牙（每轮只发一次）；LE Audio 恢复即复位。
      */
-    private fun maybeRecoverLeAudio(leAudioNow: Boolean) {
+    private fun maybeRecoverLeAudio() {
         if (!isConnected) {
             if (leAudioRecoveryAttempts > 0 || leAudioRecoveryStartAt != 0L) {
                 leAudioRecoveryStartAt = 0L
@@ -1527,7 +1547,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             return
         }
         val now = SystemClock.elapsedRealtime()
-        if (leAudioNow) {
+        if (!agentLeAudioMissing()) {
             if (leAudioRecoveryAttempts > 0) {
                 PanaLog.i(
                     TAG,
@@ -1563,32 +1583,42 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         if (now - leAudioRecoveryStartAt < 15_000L) return
         if (leAudioRecoveryLastAttemptAt != 0L && now - leAudioRecoveryLastAttemptAt < 30_000L) return
         leAudioRecoveryLastAttemptAt = now
-        leAudioRecoveryAttempts += 1
-        attemptLeAudioConnect()
+        // v183：只有真正发起了反射 connect 才计入尝试预算
+        // （proxy 未绑定/无目标的空转轮次不烧 3 次，否则必然误发通知）
+        if (attemptLeAudioConnect()) leAudioRecoveryAttempts += 1
     }
 
-    /** v182：反射调用隐藏 API BluetoothLeAudio.connect(device)，把 agent 的 LE Audio 拉起来。 */
-    private fun attemptLeAudioConnect() {
+    /**
+     * v182：反射调用隐藏 API BluetoothLeAudio.connect(device)，把 agent 的 LE Audio 拉起来。
+     *
+     * @return 本轮次是否计入尝试预算。
+     * v183：proxy 未绑定 / 无目标 → false（不计数）；反射 API 缺失或被拒属
+     * 永久性失败 → 直接置满预算，让 90s 通知兜底（提示用户开关蓝牙）。
+     */
+    private fun attemptLeAudioConnect(): Boolean {
         val proxy = synchronized(profileProxyLock) { profileProxyMap[BluetoothProfile.LE_AUDIO] }
         if (proxy == null) {
-            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} skipped, LE_AUDIO proxy not bound")
-            return
+            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts + 1} skipped, LE_AUDIO proxy not bound")
+            return false
         }
         val targets = leAudioRecoveryTargets(proxy)
         if (targets.isEmpty()) {
-            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} no target device")
-            return
+            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts + 1} no target device")
+            return false
         }
+        var attempted = false
         for (dev in targets) {
             val r = try {
                 val m = proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
                 m.invoke(proxy, dev)
             } catch (e: NoSuchMethodException) {
                 PanaLog.w(TAG, "LE-AUDIO-RECOVER: hidden connect() not found (${proxy.javaClass.name})")
-                return
+                leAudioRecoveryAttempts = 3
+                return false
             } catch (e: SecurityException) {
                 PanaLog.w(TAG, "LE-AUDIO-RECOVER: SecurityException: ${e.message}")
-                return
+                leAudioRecoveryAttempts = 3
+                return false
             } catch (e: java.lang.reflect.InvocationTargetException) {
                 PanaLog.w(
                     TAG,
@@ -1597,10 +1627,12 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 continue
             } catch (e: Throwable) {
                 PanaLog.w(TAG, "LE-AUDIO-RECOVER: connect failed: ${e.javaClass.simpleName}: ${e.message}")
-                return
+                return false
             }
-            PanaLog.i(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} hidden connect($dev) -> $r")
+            PanaLog.i(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts + 1} hidden connect($dev) -> $r")
+            attempted = true
         }
+        return attempted
     }
 
     /** v182：恢复目标 = 已知 Pana 地址中「尚未 LE Audio 连接」的设备（最多 2 个）。 */
