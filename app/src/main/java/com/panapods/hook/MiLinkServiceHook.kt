@@ -131,10 +131,14 @@ object MiLinkServiceHook {
     // v114：缓存 setHeadsetPropertyChangeListener 注入的 listener 实例。
     // getter 在部分进程/时机返回 null（runtime 懒初始化），缓存后 nudge 不再依赖 getter。
     @Volatile private var cachedHeadsetListener: Any? = null
-    // v177：listener 尚未初始化时的待执行回调队列。setHeadsetPropertyChangeListener 被调用时触发。
-    private val listenerReadyCallbacks = java.util.Collections.newSetFromMap(
-        java.util.concurrent.ConcurrentHashMap<Runnable, Boolean>()
-    )
+    // v177：listener 未就绪时登记"待唤醒"回调，setHeadsetPropertyChangeListener 被调用时补发。
+    // v184：改为单例挂起标记 —— v177 的 Set<Runnable> 每次注册都是新 lambda 实例，Set 永远
+    // 无法去重；实测 setHeadsetPropertyChangeListener 只在 :core 的 DiscoveryImpl.bind 触发，
+    // 其余 8 个 milink 进程的队列只增不减（单个连接窗 24 分钟即积压 435~490 条永不释放，
+    // LSPosed 日志里"registered callback"刷屏挤占 4MB 轮转），且一旦 SET 到达大队列会形成
+    // 435 连发的 nudge 风暴。AtomicBoolean + 共享 Runnable 保证每进程至多挂 1 条。
+    private val listenerReadyPending = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val listenerReadyCallback = Runnable { nudgeAncCardRefresh(force = true) }
         // v100：事件驱动刷新 —— 收到 app 状态广播（电量/ANC/连接态真正变化）时才补发 nudge，
         // 替代 v99.6 的 10 连发定时 nudge，减少 milink/SystemUI 反复重 assemble 与 app 唤醒。
     @Volatile private var bridgeStateRefreshRegistered = false
@@ -897,9 +901,9 @@ object MiLinkServiceHook {
                                 PanaLog.i(TAG, "headset listener SET (${listener.javaClass.name}), nudging now")
                                 nudgeAncCardRefresh(force = true)
                                 MiLinkCardArtHook.onPanaCardMaybeActive()
-                                // v177：触发所有等待 listener 的回调
-                                listenerReadyCallbacks.forEach { it.run() }
-                                listenerReadyCallbacks.clear()
+                                // v177：补发等待 listener 的回调。v184：单例挂起标记，
+                                // getAndSet 至多补发 1 次（旧实现 forEach 整队列会风暴）。
+                                if (listenerReadyPending.getAndSet(false)) listenerReadyCallback.run()
                             } else {
                                 PanaLog.i(TAG, "headset listener CLEARED")
                             }
@@ -1720,15 +1724,27 @@ object MiLinkServiceHook {
             val pcClass = findClass(PROFILE_CONTEXT, cl) ?: run { PanaLog.w(TAG, "nudge: ProfileContext class not found"); return }
             // v114：优先用 setHeadsetPropertyChangeListener 注入时缓存的 listener。
             // getter 依赖 runtime 懒初始化，各进程大部分时间为 null（nudge 静默死亡的主因）。
-            val listener = cachedHeadsetListener
-                ?: XposedHelpers.callMethod(XposedHelpers.getStaticObjectField(pcClass, "INSTANCE"), "getHeadsetPropertyChangeListener")
+            // v184：getter 解析单独 try —— 旧实现里反射抛异常会直接跳到外层 catch，
+            // 跳过"待唤醒登记"，管线在异常进程里静默死亡且无法被 SET 唤醒。
+            val listener = try {
+                cachedHeadsetListener
+                    ?: XposedHelpers.callMethod(XposedHelpers.getStaticObjectField(pcClass, "INSTANCE"), "getHeadsetPropertyChangeListener")
+            } catch (t: Throwable) {
+                PanaLog.d(TAG, "nudge: listener resolve failed: ${t.message}")
+                null
+            }
             if (listener == null) {
-                // v177：listener 尚未初始化，注册一次性回调，初始化后立即补发（force=true 绕过节流）。
-                val callback = Runnable { nudgeAncCardRefresh(force = true) }
-                listenerReadyCallbacks.add(callback)
-                PanaLog.d(TAG, "nudge: listener null, registered callback (queue=${listenerReadyCallbacks.size})")
+                // v177：listener 尚未初始化，登记待唤醒回调，SET 到达后补发（force 绕过节流）。
+                // v184：单例挂起标记合并重复登记（详见字段注释）——只在首次登记打日志，
+                // 消除 listener 永不 set 的进程里每 3s 一条的刷屏与回调积压。
+                if (listenerReadyPending.compareAndSet(false, true)) {
+                    PanaLog.d(TAG, "nudge: listener null, pending callback registered")
+                }
                 return
             }
+            // v184：listener 已就绪，清掉"读到 null→setter 先行补发"竞态残留的挂起标记
+            // （本次 nudge 自身就是补发）。
+            listenerReadyPending.set(false)
             val addr = activePanaAddress
                 ?: getLeAudioActivePanaAddress()
                 ?: PanaBridge.getMacAddress()
