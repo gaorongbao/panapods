@@ -68,6 +68,14 @@ class AirohaBleClient(
         // 用此门闩：只处理 refresh 之后我们主动请求的那次 MTU 回调，忽略自发回调。
     private var mtuRequested = false
     private var lastAddress: String? = null
+    // v185：connectGatt transport 选择（建立失败即与另一种乒乓互换）。
+    // TRANSPORT_AUTO（v92 的无参形式）在双模设备上会把 GATT 骑到经典 ACL —— 实测
+    // 22:52 经典 ACL 建立同秒 attach、10s 后被耳机拆链、GATT 同秒 status=133
+    // (GATT_CONN_FAIL_ESTABLISH)，而 LE 链路根本没人建 → 单侧使用永远连不上。
+    // 反向教训（v92）是部分 HyperOS 上显式 TRANSPORT_LE 回调不来。
+    // 两条路各有失败案例，故按「哪条建立失败就换另一条」乒乓兜底：能通的那条自然留下。
+    @Volatile
+    private var useLeTransport = false
     private val retryHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val retryPolicy = ConnectRetryPolicy(retryHandler)
     private val writeQueue = GattWriteQueue(
@@ -104,6 +112,18 @@ class AirohaBleClient(
         failGatt("notifications assumed but no data in ${CCC_ASSUMED_NO_DATA_TIMEOUT_MS}ms")
     }
 
+    /**
+     * 建立阶段失败（无回调超时 / status=133 等）：与另一种 transport 乒乓互换。
+     * 见 [useLeTransport] 注释——两条路各有失败机型/场景，失败即换，能通的自然留下。
+     */
+    private fun noteEstablishFailure(why: String) {
+        useLeTransport = !useLeTransport
+        PanaLog.i(
+            TAG,
+            "transport fallback -> ${if (useLeTransport) "TRANSPORT_LE" else "AUTO"} ($why)"
+        )
+    }
+
     // Connect watchdog: connectGatt succeeded but the BT stack never delivered
     // STATE_CONNECTED. Close the half-open GATT and either auto-retry or report failure
     // so the service can fall back to its own watchdog.
@@ -124,6 +144,7 @@ class AirohaBleClient(
             lastAddress?.let { addr -> connectInternal(addr, resetRetry = false) }
         }
         if (delay >= 0) {
+            noteEstablishFailure("no callback")
             PanaLog.i(TAG, "connect establishment failed (no callback), auto-retry ${retryPolicy.count}/${retryPolicy.maxRetries} in ${delay}ms")
         } else {
             PanaLog.e(TAG, "connect establishment failed (no callback), max retries reached, giving up")
@@ -231,6 +252,7 @@ class AirohaBleClient(
                             lastAddress?.let { addr -> connectInternal(addr, resetRetry = false) }
                         }
                         if (delay >= 0) {
+                            noteEstablishFailure("status=$status")
                             PanaLog.i(TAG, "Connect establish failed (status=$status), auto-retry ${retryPolicy.count}/${retryPolicy.maxRetries} in ${delay}ms")
                         }
                     } else {
@@ -456,10 +478,15 @@ class AirohaBleClient(
         
                 // v92: HyperOS 4 兼容性修复 —— 尝试不使用 TRANSPORT_LE 参数
                 // 验证方案：查看是否是 TRANSPORT_LE 导致 connectGatt 回调不来
+        // v185: 建立失败时由 noteEstablishFailure() 乒乓翻转（见 useLeTransport 注释）。
         val gatt = try {
-            PanaLog.d(TAG, "connectGatt without explicit TRANSPORT parameter (SDK ${Build.VERSION.SDK_INT})")
-                        // v92: 移除 TRANSPORT_LE，使用系统默认
-            device.connectGatt(context, false, gattCallback)
+            if (useLeTransport) {
+                PanaLog.d(TAG, "connectGatt(TRANSPORT_LE) (SDK ${Build.VERSION.SDK_INT})")
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                PanaLog.d(TAG, "connectGatt without explicit TRANSPORT parameter (SDK ${Build.VERSION.SDK_INT})")
+                device.connectGatt(context, false, gattCallback)
+            }
         } catch (e: Throwable) {
             PanaLog.e(TAG, "connectGatt() threw exception: ${e.message}", e)
             listener?.onError("connectGatt failed: ${e.javaClass.simpleName} ${e.message}")

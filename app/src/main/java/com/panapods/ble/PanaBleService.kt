@@ -586,7 +586,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // 否则连接目标会被永久钉在已消失的地址上，每 20s 超时重连一次永不停歇
         // —— 表现为 App 一直「正在连接」、融合中心与 TWS 的电量/照片全部失效。
         val live = livePanaAddress()
-        val target = if (!isAddressConnected(address) && live != null &&
+        var target = if (!isAddressConnected(address) && live != null &&
             !live.equals(address, ignoreCase = true) &&
             PanaBridge.isSameDeviceAddress(live, address)
         ) {
@@ -603,6 +603,33 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // 重复尝试按指数退避限流，避免每 5~6s 拉起又拆掉一条 ACL 干扰 LE Audio。
         val now = SystemClock.elapsedRealtime()
         val leAudio = isLeAudioConnected()
+
+        // v185：连续硬失败后轮换到已知兄弟地址。
+        // 单耳场景下 lastBtAddress 可能漂移到充电盒里那只耳（MainActivity 打开即按它
+        // 自动连接、BtEventReceiver 按任一耳 ACL 写入），而 [LE] 型地址（1C:2F）只有
+        // 手机侧发起 LE 连接才会通——若目标没有 ACL、也没有任何在线兄弟可跟随，
+        // 连续失败 streak>=2 就构成「当前目标不可达」的客观证据，换成同副另一只试。
+        // 两只都不可达时轮换不增加尝试频率（退避照常限流），其中一只可达时最多多付
+        // 一个失败周期即可命中。
+        if (live == null && !leAudio && connectBackoff.streak >= 2 && !isAddressConnected(target)) {
+            val sibling = listOfNotNull(
+                currentState.macAddress,
+                config.lastBtAddress,
+                PanaBridge.getMacAddress(),
+                PanaBridge.getLc3MacAddress()
+            ).distinct().firstOrNull {
+                !it.equals(target, ignoreCase = true) &&
+                    PanaBridge.isSameDeviceAddress(it, target)
+            }
+            if (sibling != null) {
+                PanaLog.i(
+                    TAG,
+                    "CONN-TRACE: rotate target $target -> $sibling (streak=${connectBackoff.streak}, neither address present)"
+                )
+                stateListener?.onLogReceived("ROTATE: $target -> $sibling")
+                target = sibling
+            }
+        }
         val presentAtSystem = isAddressConnected(target) ||
             (currentState.macAddress?.let { isAddressConnected(it) } ?: false) ||
             leAudio
@@ -642,6 +669,23 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             if (actuallyConnected) {
                 PanaLog.d(TAG, "connect: same device already connected (current=$currentAddr acl=$target), ignore")
                 stateListener?.onLogReceived("WARN: same device already connected via $currentAddr, ignore ACL $target")
+                return
+            }
+            // v185：兄弟地址换目标需要客观依据。进行中的连接（isConnecting 且尚未 isConnected）
+            // 是按「最后连上的那只」发起的；若新目标在系统里连 ACL 都没有，仅凭可能已漂移的
+            // 地址（MainActivity 打开时按 config.lastBtAddress 自动连接）就掐断进行中的尝试，
+            // 会把目标锁到充电盒里那只耳上 —— 实测 22:38:38 打开 App 掐断进行中的右耳连接、
+            // 改连盒中的左耳，此后 24 分钟全部 status=133，表现为「单耳死活不连接」。
+            // 例外：streak>=2 说明进行中的目标已被反复证伪，此时换目标有失败证据放行
+            // （上面 Fix 3 的轮换同样以该信号为门槛）。
+            if (isConnecting && !isConnected && !sameAddress && sameDevice &&
+                !isAddressConnected(target) && connectBackoff.streak < 2
+            ) {
+                PanaLog.i(
+                    TAG,
+                    "connect: keep in-flight to $currentAddr (target=$target has no ACL, no evidence to switch, streak=${connectBackoff.streak})"
+                )
+                stateListener?.onLogReceived("KEEP: in-flight $currentAddr (target $target not present)")
                 return
             }
             PanaLog.w(TAG, "connect: stale connection state (isConnected=$isConnected isConnecting=$isConnecting sameAddress=$sameAddress sameDevice=$sameDevice), forcing reconnect to $target")
