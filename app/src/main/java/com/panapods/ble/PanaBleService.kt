@@ -1,5 +1,7 @@
 package com.panapods.ble
 
+import android.app.Notification
+import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -269,6 +271,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     @Volatile private var noisyPauseAt = 0L
     // 续播窗口：NOISY 后路由恢复超过该时长即认为与本次停播无关，不再干预。
     private val noisyResumeWindowMs = 60_000L
+    // v182：agent 侧 LE Audio 断连自愈状态。
+    // 实测：蓝牙系统进程崩溃重启后，agent 的 LE Audio 连接一次超时就再也没被系统
+    // 重试（右耳反而连上并成为活动输出）→ 音乐只发右耳、左耳无声。系统无公开 API
+    // 可拉起，这里检测持续断连后反射隐藏 API BluetoothLeAudio.connect() 主动恢复。
+    private var leAudioRecoveryStartAt = 0L
+    private var leAudioRecoveryLastAttemptAt = 0L
+    private var leAudioRecoveryAttempts = 0
+    private var leAudioRecoveryNotified = false
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
     private var protocolEngine: PanaProtocolEngine? = null
@@ -374,6 +384,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 triggerTwSync()
             }
             lastLeAudioConnected = leAudioNow
+            // v182：agent侧 LE Audio 断连检测 + 主动恢复（崩溃重启后系统不重试的场景）
+            maybeRecoverLeAudio(leAudioNow)
             
             // v179：检测音频开始播放，此时必须确保 TWS 转发链路已建立
             if (musicActive && !lastMusicActive) {
@@ -1221,6 +1233,11 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         lastMusicActive = false
         // v181：清除 NOISY 续播标记，防止跨会话误续播
         noisyPauseAt = 0L
+        // v182：清除 LE Audio 恢复状态，新连接会话重新计数
+        leAudioRecoveryStartAt = 0L
+        leAudioRecoveryLastAttemptAt = 0L
+        leAudioRecoveryAttempts = 0
+        leAudioRecoveryNotified = false
     }
 
     /**
@@ -1479,6 +1496,162 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
         }.onFailure { e ->
             PanaLog.w(TAG, "AUDIO-EVT: media play dispatch failed: ${e.message}")
+        }
+    }
+
+    /**
+     * v182：agent 侧 LE Audio 断连自愈。
+     *
+     * 实测现场（09-26 17:16:33 蓝牙系统进程崩溃重启）：双耳 LE Audio 直连均超时失败，
+     * 右耳随后被系统重连并成为活动输出（mActiveAudioOutDevice=1C:2F、group lead=1C:2F），
+     * 而左耳（agent、GATT 在线、双耳在位）的 LE Audio 再也没被系统重试 → 音乐只发
+     * 右耳，左耳无声，持续 20+ 分钟。系统侧没有公开 API 可触发 profile 重连，
+     * 这里反射调用隐藏的 BluetoothLeAudio.connect(device) 主动拉起。
+     *
+     * 触发条件（电量轮询每 2s 一查，全部满足才推进）：
+     * 1. GATT 已连接（本轮询本身只在连接态运行）；
+     * 2. 至少一侧耳机在位（否则无需音频通道）；
+     * 3. LE Audio 视角确实没有本机（isLeAudioConnected()==false，四个来源全空）；
+     * 4. A2DP 没有兜底（经典通路已连本耳机时不动）。
+     * 检测持续 15s 后开始首次尝试，之后每 30s 一次，单轮最多 3 次；
+     * 3 次失败发一条通知提示用户开关蓝牙（每轮只发一次）；LE Audio 恢复即复位。
+     */
+    private fun maybeRecoverLeAudio(leAudioNow: Boolean) {
+        if (!isConnected) {
+            if (leAudioRecoveryAttempts > 0 || leAudioRecoveryStartAt != 0L) {
+                leAudioRecoveryStartAt = 0L
+                leAudioRecoveryLastAttemptAt = 0L
+                leAudioRecoveryAttempts = 0
+                leAudioRecoveryNotified = false
+            }
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (leAudioNow) {
+            if (leAudioRecoveryAttempts > 0) {
+                PanaLog.i(
+                    TAG,
+                    "LE-AUDIO-RECOVER: agent LE Audio restored after ${leAudioRecoveryAttempts} attempt(s)"
+                )
+            }
+            leAudioRecoveryStartAt = 0L
+            leAudioRecoveryLastAttemptAt = 0L
+            leAudioRecoveryAttempts = 0
+            leAudioRecoveryNotified = false
+            return
+        }
+        // 在位未知/都不在位 → 不折腾；A2DP 兜底在用 → 不需要 LE Audio
+        if (batteryTracker.leftPresent == false && batteryTracker.rightPresent == false) return
+        if (a2dpConnectedForPana()) return
+        if (leAudioRecoveryStartAt == 0L) {
+            leAudioRecoveryStartAt = now
+            PanaLog.i(
+                TAG,
+                "LE-AUDIO-RECOVER: agent LE Audio missing (Lpresent=${batteryTracker.leftPresent} " +
+                    "Rpresent=${batteryTracker.rightPresent} music=${isMusicActive()}), watching 15s"
+            )
+            return
+        }
+        if (leAudioRecoveryAttempts >= 3) {
+            if (!leAudioRecoveryNotified && now - leAudioRecoveryStartAt > 90_000L) {
+                leAudioRecoveryNotified = true
+                PanaLog.w(TAG, "LE-AUDIO-RECOVER: giving up after 3 attempts, notifying user")
+                postLeAudioRecoveryHint()
+            }
+            return
+        }
+        if (now - leAudioRecoveryStartAt < 15_000L) return
+        if (leAudioRecoveryLastAttemptAt != 0L && now - leAudioRecoveryLastAttemptAt < 30_000L) return
+        leAudioRecoveryLastAttemptAt = now
+        leAudioRecoveryAttempts += 1
+        attemptLeAudioConnect()
+    }
+
+    /** v182：反射调用隐藏 API BluetoothLeAudio.connect(device)，把 agent 的 LE Audio 拉起来。 */
+    private fun attemptLeAudioConnect() {
+        val proxy = synchronized(profileProxyLock) { profileProxyMap[BluetoothProfile.LE_AUDIO] }
+        if (proxy == null) {
+            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} skipped, LE_AUDIO proxy not bound")
+            return
+        }
+        val targets = leAudioRecoveryTargets(proxy)
+        if (targets.isEmpty()) {
+            PanaLog.w(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} no target device")
+            return
+        }
+        for (dev in targets) {
+            val r = try {
+                val m = proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                m.invoke(proxy, dev)
+            } catch (e: NoSuchMethodException) {
+                PanaLog.w(TAG, "LE-AUDIO-RECOVER: hidden connect() not found (${proxy.javaClass.name})")
+                return
+            } catch (e: SecurityException) {
+                PanaLog.w(TAG, "LE-AUDIO-RECOVER: SecurityException: ${e.message}")
+                return
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                PanaLog.w(
+                    TAG,
+                    "LE-AUDIO-RECOVER: connect threw ${e.targetException?.javaClass?.name}: ${e.targetException?.message}"
+                )
+                continue
+            } catch (e: Throwable) {
+                PanaLog.w(TAG, "LE-AUDIO-RECOVER: connect failed: ${e.javaClass.simpleName}: ${e.message}")
+                return
+            }
+            PanaLog.i(TAG, "LE-AUDIO-RECOVER: attempt#${leAudioRecoveryAttempts} hidden connect($dev) -> $r")
+        }
+    }
+
+    /** v182：恢复目标 = 已知 Pana 地址中「尚未 LE Audio 连接」的设备（最多 2 个）。 */
+    private fun leAudioRecoveryTargets(proxy: BluetoothProfile): List<BluetoothDevice> {
+        val adapter = try {
+            BluetoothAdapter.getDefaultAdapter()
+        } catch (_: Throwable) {
+            null
+        } ?: return emptyList()
+        val connectedList: List<BluetoothDevice> = try {
+            proxy.connectedDevices
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        val connectedAddrs = connectedList
+            .mapNotNull { try { it.address?.uppercase() } catch (_: Throwable) { null } }
+            .toSet()
+        val addrs = linkedSetOf<String>()
+        for (ref in liveRefsSnapshotForObserver()) {
+            if (!ref.isNullOrBlank()) addrs.add(ref.uppercase())
+        }
+        for (a in systemConnectedAddresses) addrs.add(a.uppercase())
+        return addrs
+            .filter { it !in connectedAddrs }
+            .mapNotNull { a -> runCatching { adapter.getRemoteDevice(a) }.getOrNull() }
+            .take(2)
+    }
+
+    /** v182：A2DP 兜底检测——经典通路已连本耳机时不去干预 LE Audio。 */
+    private fun a2dpConnectedForPana(): Boolean {
+        val list = profileProxyDevices(BluetoothProfile.A2DP) ?: return false
+        if (list.isEmpty()) return false
+        val refs = liveRefsSnapshotForObserver().filterNotNull()
+        return list.any { d ->
+            val a = try { d.address } catch (_: Throwable) { null }
+            a != null && refs.any { r -> PanaBridge.isSameDeviceAddress(a, r) }
+        }
+    }
+
+    /** v182：三次恢复失败后的用户提示（复用前台服务渠道，独立 ID 不覆盖常驻通知）。 */
+    private fun postLeAudioRecoveryHint() {
+        try {
+            val nm = getSystemService(NotificationManager::class.java) ?: return
+            val n = Notification.Builder(this, "panapods_ble")
+                .setContentTitle("PanaPods：耳机音频通道未恢复")
+                .setContentText("音乐可能只有一侧出声。可关闭再打开手机蓝牙，或把耳机放回盒中再取出。")
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .build()
+            nm.notify(1002, n)
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "LE-AUDIO-RECOVER: notify failed: ${t.message}")
         }
     }
 
