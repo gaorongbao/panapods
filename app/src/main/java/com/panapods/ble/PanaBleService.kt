@@ -260,6 +260,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
 
     // v178：记录上一次 LE Audio 连接状态，用于检测连接建立瞬间并触发 TWS 同步。
     @Volatile private var lastLeAudioConnected = false
+    // v179：记录上一次音乐播放状态，用于检测音频开始流动瞬间。
+    @Volatile private var lastMusicActive = false
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
     private var protocolEngine: PanaProtocolEngine? = null
@@ -365,6 +367,13 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 triggerTwSync()
             }
             lastLeAudioConnected = leAudioNow
+            
+            // v179：检测音频开始播放，此时必须确保 TWS 转发链路已建立
+            if (musicActive && !lastMusicActive) {
+                PanaLog.i(TAG, "Music playback started, triggering TWS sync for audio forwarding")
+                triggerTwSync()
+            }
+            lastMusicActive = musicActive
             
             refreshBattery(light = musicActive)
             if (isConnected) {
@@ -967,7 +976,48 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
         PanaLog.d(TAG, "Side probe: side=$side present=$present")
         batteryTracker.onSideProbeReceived(side, present)
+        // v179：侧边探测明确不在位时，立即清除该侧电量，避免单耳场景下另一只显示残留电量
+        if (!present) {
+            clearBatteryForSide(side)
+        }
         recomputeBatteryState()
+    }
+
+    /** 根据物理侧清除对应的电量缓存（agent/partner 角色不固定，需按当前映射清除）。 */
+    private fun clearBatteryForSide(side: Int) {
+        // 先按当前映射判断哪个角色对应该物理侧，再清除
+        val (leftBat, rightBat) = batteryTracker.computeDisplayBatteries()
+        when (side) {
+            PanaProtocolEngine.SIDE_LEFT -> {
+                if (leftBat != null) {
+                    // 反推：当前左耳对应 agent 还是 partner？
+                    val agentSideIsLeft = when {
+                        batteryTracker.leftPresent == true && batteryTracker.rightPresent == true -> batteryTracker.agentIsLeft
+                        batteryTracker.leftPresent == false -> false
+                        batteryTracker.rightPresent == false -> true
+                        batteryTracker.leftPresent == true -> true
+                        batteryTracker.rightPresent == true -> false
+                        else -> batteryTracker.agentIsLeft
+                    }
+                    if (agentSideIsLeft) batteryTracker.clearAgentBattery() else batteryTracker.clearPartnerBattery()
+                    PanaLog.d(TAG, "Side probe: LEFT not present, cleared ${if (agentSideIsLeft) "agent" else "partner"} battery")
+                }
+            }
+            PanaProtocolEngine.SIDE_RIGHT -> {
+                if (rightBat != null) {
+                    val agentSideIsLeft = when {
+                        batteryTracker.leftPresent == true && batteryTracker.rightPresent == true -> batteryTracker.agentIsLeft
+                        batteryTracker.leftPresent == false -> false
+                        batteryTracker.rightPresent == false -> true
+                        batteryTracker.leftPresent == true -> true
+                        batteryTracker.rightPresent == true -> false
+                        else -> batteryTracker.agentIsLeft
+                    }
+                    if (agentSideIsLeft) batteryTracker.clearPartnerBattery() else batteryTracker.clearAgentBattery()
+                    PanaLog.d(TAG, "Side probe: RIGHT not present, cleared ${if (agentSideIsLeft) "partner" else "agent"} battery")
+                }
+            }
+        }
     }
 
     /**
@@ -1043,8 +1093,17 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         engine.discoverPartnerDst()
         // 若已有缓存的 dst，立即补发一次 relay 查询，建立转发路径
         if (partnerDstType >= 0 && partnerDstId >= 0) {
-            PanaLog.d(TAG, "TWS sync: supplemental relay to type=$partnerDstType id=$partnerDstId")
+            PanaLog.d(TAG, "TWS sync: immediate relay to type=$partnerDstType id=$partnerDstId")
             engine.relayGetBattery(partnerDstType, partnerDstId)
+        } else {
+            // v179：dst 尚未缓存，等待 discoverPartnerDst 异步返回后补发 relay
+            // 500ms 后检查一次，若 discovery 已完成则发 relay
+            mainHandler.postDelayed({
+                if (isConnected && partnerDstType >= 0 && partnerDstId >= 0) {
+                    PanaLog.d(TAG, "TWS sync: delayed relay to type=$partnerDstType id=$partnerDstId")
+                    protocolEngine?.relayGetBattery(partnerDstType, partnerDstId)
+                }
+            }, 500)
         }
     }
 
@@ -1152,6 +1211,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         partnerDstId = -1
         // v178：重置 LE Audio 连接状态标记，下次连接时重新触发 TWS 同步
         lastLeAudioConnected = false
+        // v179：重置音乐播放状态标记
+        lastMusicActive = false
     }
 
     /**

@@ -22,8 +22,8 @@ android {
         applicationId = "com.panapods"
         minSdk = 35
         targetSdk = 35
-        versionCode = 179
-        versionName = "1.0.179"
+        versionCode = 180
+        versionName = "1.0.180"
 
         // minSdk >= 21 时系统原生支持 multidex，无需 multiDexEnabled / multiDexKeepProguard。
         // Xposed 入口类 (HookEntry) 由 proguard-rules.pro 的 -keep 规则保护，不会被 R8 裁剪。

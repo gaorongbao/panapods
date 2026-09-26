@@ -105,6 +105,11 @@ class BatteryStateTracker {
         partnerBattery = null
     }
 
+    /** v179：单耳不在位时清空主耳电量。 */
+    fun clearAgentBattery() {
+        agentBattery = null
+    }
+
     /** 断开连接时清空本会话所有传感器状态。 */
     fun reset() {
         agentBattery = null
